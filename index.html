@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MTG pHash Visualizer</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; background: #f0f0f0; padding: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 15px; }
+        .card { background: white; padding: 10px; border-radius: 8px; text-align: center; }
+        .card img { max-width: 100%; border-radius: 4px; }
+        .hash { font-family: monospace; color: #007aff; font-size: 12px; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <h1>MTG Hash Visualizer</h1>
+    <div class="grid" id="grid"></div>
+
+    <script>
+        async function loadCards() {
+            // This will fetch the JSON that your macOS app pushes!
+            const response = await fetch('manifest.json'); 
+            // NOTE: If you add the JSON export back to your Mac app, fetch 'visualizer_data.json' instead.
+            // For now, this just proves the page works.
+            document.getElementById('grid').innerHTML = "<p>Ready to load visualizer data.</p>";
+        }
+        loadCards();
+    </script>
+</body>
+</html>
