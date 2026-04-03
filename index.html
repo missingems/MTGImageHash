@@ -1,28 +1,220 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MTG pHash Visualizer</title>
     <style>
-        body { font-family: -apple-system, sans-serif; background: #f0f0f0; padding: 20px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 15px; }
-        .card { background: white; padding: 10px; border-radius: 8px; text-align: center; }
-        .card img { max-width: 100%; border-radius: 4px; }
-        .hash { font-family: monospace; color: #007aff; font-size: 12px; margin-top: 8px; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            background: #f5f5f7; 
+            color: #1d1d1f;
+            padding: 20px; 
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .search-container {
+            margin-bottom: 30px;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 12px 20px;
+            font-size: 16px;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            box-sizing: border-box;
+            outline: none;
+        }
+        input[type="text"]:focus {
+            border-color: #007aff;
+            box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.2);
+        }
+        .grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); 
+            gap: 20px; 
+        }
+        .card { 
+            background: white; 
+            padding: 15px; 
+            border-radius: 12px; 
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .card img { 
+            width: 100%; 
+            border-radius: 6px; 
+            background: #e5e5ea;
+            min-height: 250px;
+            object-fit: contain;
+        }
+        .card-name {
+            font-size: 14px;
+            font-weight: 600;
+            margin-top: 12px;
+            text-align: center;
+        }
+        .card-set {
+            font-size: 12px;
+            color: #86868b;
+            margin-top: 4px;
+        }
+        .hash-badge { 
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+            background: rgba(0, 122, 255, 0.1);
+            color: #007aff;
+            font-size: 11px; 
+            font-weight: bold;
+            padding: 4px 8px;
+            border-radius: 6px;
+            margin-top: 10px;
+            word-break: break-all;
+            text-align: center;
+        }
+        #status {
+            color: #86868b;
+            font-size: 14px;
+        }
+        /* The invisible trigger element for infinite scrolling */
+        #scroll-trigger {
+            height: 20px;
+            margin-top: 20px;
+            text-align: center;
+            color: #86868b;
+            font-size: 14px;
+        }
     </style>
 </head>
 <body>
-    <h1>MTG Hash Visualizer</h1>
+
+    <div class="header">
+        <h1>MTG Indexer Database</h1>
+        <div id="status">Loading database...</div>
+    </div>
+
+    <div class="search-container">
+        <input type="text" id="searchInput" placeholder="Search for a card name..." disabled>
+    </div>
+
     <div class="grid" id="grid"></div>
+    
+    <div id="scroll-trigger"></div>
 
     <script>
-        async function loadCards() {
-            // This will fetch the JSON that your macOS app pushes!
-            const response = await fetch('manifest.json'); 
-            // NOTE: If you add the JSON export back to your Mac app, fetch 'visualizer_data.json' instead.
-            // For now, this just proves the page works.
-            document.getElementById('grid').innerHTML = "<p>Ready to load visualizer data.</p>";
+        let allCards = [];
+        let currentFilteredCards = [];
+        let renderedCount = 0;
+        const BATCH_SIZE = 50;
+
+        const grid = document.getElementById('grid');
+        const searchInput = document.getElementById('searchInput');
+        const statusText = document.getElementById('status');
+        const scrollTrigger = document.getElementById('scroll-trigger');
+
+        // 1. Setup the Intersection Observer for Infinite Scrolling
+        const observer = new IntersectionObserver((entries) => {
+            // If the trigger div is visible on screen, render the next batch
+            if (entries[0].isIntersecting) {
+                renderNextBatch();
+            }
+        }, { 
+            rootMargin: "400px" // Start loading 400px BEFORE the user hits the absolute bottom 
+        });
+
+        // 2. Fetch the JSON generated by the macOS app
+        async function init() {
+            try {
+                const response = await fetch('visualizer_data.json');
+                allCards = await response.json();
+                
+                // Initially, the filtered list is the whole database
+                currentFilteredCards = allCards;
+                statusText.innerText = `${allCards.length.toLocaleString()} faces loaded.`;
+                
+                searchInput.disabled = false;
+                searchInput.focus();
+                
+                // Start observing the trigger element
+                observer.observe(scrollTrigger);
+                
+                // Render first batch
+                renderNextBatch();
+            } catch (error) {
+                statusText.innerText = "Error loading database.";
+                statusText.style.color = "red";
+            }
         }
-        loadCards();
+
+        // 3. Render a chunk of cards and append them
+        function renderNextBatch() {
+            if (renderedCount >= currentFilteredCards.length) {
+                scrollTrigger.innerText = renderedCount === 0 ? "No matches found." : "End of results.";
+                return;
+            }
+
+            scrollTrigger.innerText = "Loading more...";
+
+            // Use a DocumentFragment for performance (batches DOM updates)
+            const fragment = document.createDocumentFragment();
+            const nextBatch = currentFilteredCards.slice(renderedCount, renderedCount + BATCH_SIZE);
+
+            nextBatch.forEach(card => {
+                const div = document.createElement('div');
+                div.className = 'card';
+                
+                const displayName = card.faceName ? `${card.name} // ${card.faceName}` : card.name;
+                const imgTag = card.imageUri 
+                    ? `<img src="${card.imageUri}" loading="lazy" alt="${card.name}">` 
+                    : `<div style="height: 250px; display: flex; align-items:center; color:#86868b; font-size:12px;">No Image</div>`;
+
+                div.innerHTML = `
+                    ${imgTag}
+                    <div class="card-name">${displayName}</div>
+                    <div class="card-set">${card.set}</div>
+                    <div class="hash-badge">${card.hashHex}</div>
+                `;
+                fragment.appendChild(div);
+            });
+
+            grid.appendChild(fragment);
+            renderedCount += nextBatch.length;
+
+            // Update status
+            statusText.innerText = `Showing ${renderedCount.toLocaleString()} of ${currentFilteredCards.length.toLocaleString()}`;
+
+            // If we've loaded everything, clear the trigger text
+            if (renderedCount >= currentFilteredCards.length) {
+                scrollTrigger.innerText = "End of results.";
+            } else {
+                scrollTrigger.innerText = "";
+            }
+        }
+
+        // 4. Listen for typing in the search bar
+        searchInput.addEventListener('input', (e) => {
+            const term = e.target.value.toLowerCase();
+            
+            // Filter the full dataset
+            currentFilteredCards = allCards.filter(c => c.name.toLowerCase().includes(term));
+            
+            // Reset the grid and counters
+            grid.innerHTML = '';
+            renderedCount = 0;
+            
+            // Render the first 50 results of the new search
+            renderNextBatch();
+        });
+
+        // Start
+        init();
     </script>
 </body>
 </html>
