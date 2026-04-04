@@ -39,12 +39,14 @@ struct DatabaseManifest: Codable {
     let lastUpdated: String
 }
 
-// MARK: - pHash Engine
-let pHashDCTSetup = vDSP_DCT_CreateSetup(nil, 32, .II)!
+// MARK: - pHash Engine Setup
+// Wrapped in an enum to prevent "top-level code" compiler errors
+enum MathEngine {
+    static let pHashDCTSetup = vDSP_DCT_CreateSetup(nil, 32, .II)!
+}
 
 func generatePHash(from url: URL) async -> UInt64? {
     do {
-        // Fetch image data
         let (data, _) = try await URLSession.shared.data(from: url)
         guard let image = NSImage(data: data),
               let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
@@ -52,29 +54,35 @@ func generatePHash(from url: URL) async -> UInt64? {
         let size = 32
         var pixelBytes = [UInt8](repeating: 0, count: size * size)
         
-        // Draw to grayscale
         guard let ctx = CGContext(data: &pixelBytes, width: size, height: size, bitsPerComponent: 8, bytesPerRow: size, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return nil }
         ctx.interpolationQuality = .high
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: size, height: size))
         
-        // UInt8 to Float for Accelerate
         var pixels = [Float](repeating: 0, count: size * size)
         vDSP_vfltu8(pixelBytes, 1, &pixels, 1, vDSP_Length(size * size))
         
-        // 1. DCT Rows
+        // 1. DCT Rows (Safely accessing memory pointers)
         var rowDCT = [Float](repeating: 0, count: size * size)
         for row in 0..<size {
-            vDSP_DCT_Execute(pHashDCTSetup, pixels + row * size, rowDCT + row * size)
+            pixels.withUnsafeBufferPointer { src in
+                rowDCT.withUnsafeMutableBufferPointer { dst in
+                    vDSP_DCT_Execute(MathEngine.pHashDCTSetup, src.baseAddress! + row * size, dst.baseAddress! + row * size)
+                }
+            }
         }
         
         // 2. Transpose
         var transposed = [Float](repeating: 0, count: size * size)
         vDSP_mtrans(rowDCT, 1, &transposed, 1, vDSP_Length(size), vDSP_Length(size))
         
-        // 3. DCT Columns
+        // 3. DCT Columns (Safely accessing memory pointers)
         var colDCT = [Float](repeating: 0, count: size * size)
         for row in 0..<size {
-            vDSP_DCT_Execute(pHashDCTSetup, transposed + row * size, colDCT + row * size)
+            transposed.withUnsafeBufferPointer { src in
+                colDCT.withUnsafeMutableBufferPointer { dst in
+                    vDSP_DCT_Execute(MathEngine.pHashDCTSetup, src.baseAddress! + row * size, dst.baseAddress! + row * size)
+                }
+            }
         }
         
         // 4. Transpose Back
@@ -123,7 +131,7 @@ struct Indexer {
             let (metaData, _) = try await URLSession.shared.data(from: URL(string: "https://api.scryfall.com/bulk-data/default-cards")!)
             let bulkMeta = try JSONDecoder().decode(BulkDataResponse.self, from: metaData)
             
-            print("📥 Downloading 80MB JSON Catalog...")
+            print("📥 Downloading JSON Catalog...")
             let (data, _) = try await URLSession.shared.data(from: URL(string: bulkMeta.downloadUri)!)
             let cards = try JSONDecoder().decode([ScryfallCard].self, from: data)
             
@@ -146,7 +154,7 @@ struct Indexer {
             var webRecords: [WebCardRecord] = []
             var completed = 0
             
-            // TaskGroup with concurrency limit to respect Scryfall's CDN
+            // TaskGroup with concurrency limit
             await withTaskGroup(of: (Job, UInt64?).self) { group in
                 let maxConcurrent = 20
                 var index = 0
