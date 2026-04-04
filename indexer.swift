@@ -120,86 +120,15 @@ struct Job {
     let url: URL
 }
 
-@main
+// ❌ REMOVE the @main tag that was right here
+
 struct Indexer {
     static func main() async {
         print("🚀 Starting Daily MTG Indexer...")
         let startTime = Date()
         
         do {
-            print("📥 Fetching Scryfall Bulk Data Catalog...")
-            let (metaData, _) = try await URLSession.shared.data(from: URL(string: "https://api.scryfall.com/bulk-data/default-cards")!)
-            let bulkMeta = try JSONDecoder().decode(BulkDataResponse.self, from: metaData)
-            
-            print("📥 Downloading JSON Catalog...")
-            let (data, _) = try await URLSession.shared.data(from: URL(string: bulkMeta.downloadUri)!)
-            let cards = try JSONDecoder().decode([ScryfallCard].self, from: data)
-            
-            var jobs: [Job] = []
-            for card in cards {
-                if let uris = card.image_uris, let small = uris["small"], let url = URL(string: small) {
-                    jobs.append(Job(faceId: card.id, cardName: card.name, setName: card.set, faceName: nil, url: url))
-                } else if let faces = card.card_faces {
-                    for (idx, face) in faces.enumerated() {
-                        if let uris = face.image_uris, let small = uris["small"], let url = URL(string: small) {
-                            jobs.append(Job(faceId: "\(card.id)-face\(idx)", cardName: card.name, setName: card.set, faceName: face.name, url: url))
-                        }
-                    }
-                }
-            }
-            
-            print("⚙️ Parsed \(cards.count) cards. Hashing \(jobs.count) faces...")
-            
-            var iosRecords: [CardHashRecord] = []
-            var webRecords: [WebCardRecord] = []
-            var completed = 0
-            
-            // TaskGroup with concurrency limit
-            await withTaskGroup(of: (Job, UInt64?).self) { group in
-                let maxConcurrent = 20
-                var index = 0
-                
-                while index < maxConcurrent && index < jobs.count {
-                    let job = jobs[index]
-                    group.addTask { return (job, await generatePHash(from: job.url)) }
-                    index += 1
-                }
-                
-                for await (job, hash) in group {
-                    completed += 1
-                    if completed % 1000 == 0 { print("⏳ Progress: \(completed) / \(jobs.count)") }
-                    
-                    if let h = hash {
-                        iosRecords.append(CardHashRecord(id: job.faceId, hash: h))
-                        webRecords.append(WebCardRecord(id: job.faceId, name: job.cardName, set: job.setName.uppercased(), faceName: job.faceName, hashHex: String(h, radix: 16).uppercased(), imageUri: job.url.absoluteString))
-                    }
-                    
-                    if index < jobs.count {
-                        let nextJob = jobs[index]
-                        group.addTask { return (nextJob, await generatePHash(from: nextJob.url)) }
-                        index += 1
-                    }
-                }
-            }
-            
-            print("💾 Encoding iOS BPLIST Database...")
-            let encoder = PropertyListEncoder()
-            encoder.outputFormat = .binary
-            let iosData = try encoder.encode(iosRecords)
-            let compressedIosData = try (iosData as NSData).compressed(using: .lzfse) as Data
-            
-            print("💾 Encoding Web JSON Database...")
-            let webData = try JSONEncoder().encode(webRecords)
-            
-            print("📄 Generating Manifest...")
-            let manifest = DatabaseManifest(version: Int(Date().timeIntervalSince1970), cardCount: iosRecords.count, lastUpdated: ISO8601DateFormatter().string(from: Date()))
-            let jsonEncoder = JSONEncoder()
-            jsonEncoder.outputFormatting = .prettyPrinted
-            let manifestData = try jsonEncoder.encode(manifest)
-            
-            try compressedIosData.write(to: URL(fileURLWithPath: "MTG_Hashes.bplist"))
-            try webData.write(to: URL(fileURLWithPath: "visualizer_data.json"))
-            try manifestData.write(to: URL(fileURLWithPath: "manifest.json"))
+            /* ... all the hashing logic ... */
             
             let elapsed = Date().timeIntervalSince(startTime)
             print("✅ Finished successfully in \(Int(elapsed / 60)) minutes!")
@@ -210,3 +139,6 @@ struct Indexer {
         }
     }
 }
+
+// ✅ ADD THIS LINE AT THE VERY BOTTOM OF THE FILE:
+await Indexer.main()
