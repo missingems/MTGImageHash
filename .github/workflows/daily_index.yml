@@ -1,0 +1,29 @@
+name: Daily MTG Indexing
+
+on:
+  schedule:
+    # Runs automatically at 08:00 UTC (4:00 PM Singapore Time) every day
+    - cron: '0 8 * * *'
+  workflow_dispatch: 
+    # Allows you to click a "Run workflow" button in GitHub manually whenever you want
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Swift Indexer
+        run: swift indexer.swift
+
+      - name: Commit and Push Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add MTG_Hashes.bplist visualizer_data.json manifest.json
+          git commit -m "Automated Daily DB Update: $(date -u +'%Y-%m-%d')" || echo "No changes to commit"
+          git push
