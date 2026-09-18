@@ -7,19 +7,22 @@ on:
     # Odd minutes avoid GitHub's top-of-the-hour scheduling congestion.
     - cron: '17 10,22 * * *'
   workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: Recompute every vector and start a new master version
+        type: boolean
+        default: false
 
-# Never let two runs race each other on the release assets.
+# Each run builds on the previous deployment, so never run two at once.
 concurrency:
   group: mtg-indexing
   cancel-in-progress: false
 
-env:
-  RELEASE_TAG: db-latest
-
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 90
+    # Incremental runs take minutes; a full rebuild of ~105k faces takes much longer.
+    timeout-minutes: 340
     permissions:
       contents: write
 
@@ -27,56 +30,35 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v5
 
-      - name: Run Swift Indexer
+      - name: Build feature-print database
         env:
-          OUTPUT_DIR: dist
-        run: swift indexer.swift
-
-      - name: Publish to fixed-URL release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          OUTPUT_DIR: site
+          STATE_BASE_URL: https://missingems.github.io/MTGImageHash
+          FULL_REBUILD: ${{ inputs.full_rebuild && '1' || '0' }}
         run: |
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" \
-              --title "Latest pHash Database" \
-              --notes "Rolling release, rebuilt twice daily by the MTG Indexing workflow. Asset URLs never change." \
-              --latest
-          fi
-          # Data first, manifest last: a client that sees a new manifest version
-          # can always fetch the matching database.
-          gh release upload "$RELEASE_TAG" dist/MTG_Hashes.bplist dist/visualizer_data.json --clobber
-          gh release upload "$RELEASE_TAG" dist/manifest.json --clobber
-          gh release edit "$RELEASE_TAG" --notes "Rolling release, rebuilt twice daily by the MTG Indexing workflow. Asset URLs never change.
-
-          $(cat dist/manifest.json)"
-
-      # Shipped Mooligan builds read MTG_Hashes.bplist from raw.githubusercontent.com
-      # on main, so keep it there too. Output is deterministic, so git only records
-      # a new blob when the data really changed. These commits also keep the repo
-      # "active", so GitHub doesn't disable this schedule after 60 days.
-      - name: Commit database to main
-        run: |
-          cp dist/MTG_Hashes.bplist MTG_Hashes.bplist
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add MTG_Hashes.bplist
-          if git diff --cached --quiet; then
-            echo "Database unchanged; nothing to commit"
-            exit 0
-          fi
-          cp dist/manifest.json manifest.json
-          git add manifest.json
-          git commit -m "Automated DB Update: $(date -u +'%Y-%m-%d %H:%M') UTC" || echo "No changes to commit"
-          git pull --rebase && git push
-
-      - name: Stage visualizer site
-        run: |
-          mkdir -p site
-          cp index.html dist/visualizer_data.json dist/manifest.json site/
+          swift indexer.swift
+          cp index.html site/
 
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site
+
+      # Commit the manifest when the published version moves. This records history
+      # and keeps the repo "active" so GitHub doesn't disable the schedule after
+      # 60 days without commits.
+      - name: Commit manifest
+        run: |
+          key() { jq -r '"\(.masterVersion)/\(.latestPatch)"' "$1" 2>/dev/null || echo none; }
+          if [ "$(key site/manifest.json)" = "$(key manifest.json)" ]; then
+            echo "Published version unchanged; nothing to commit"
+            exit 0
+          fi
+          cp site/manifest.json manifest.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add manifest.json
+          git commit -m "Automated DB Update: $(key manifest.json)"
+          git pull --rebase && git push
 
   pages:
     needs: build
