@@ -220,10 +220,37 @@ func computeFeaturePrint(_ imageData: Data) -> Data? {
     }
 }
 
+/// Rounds an archived feature print's floats to Float16 precision.
+///
+/// Apple Silicon Macs and iPhones compute feature prints on the Neural Engine in
+/// half precision, so their vectors (including the database bundled in Mooligan)
+/// are Float16-exact. CI's virtualised Mac falls back to full-precision CPU
+/// output, which is no more accurate for matching but compresses ~40% worse.
+/// Rounding brings CI output back in line with on-device vectors. Idempotent.
+func quantizeToHalfPrecision(_ archived: Data) -> Data {
+    guard let observation = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: archived),
+          observation.elementType == .float,
+          var plist = try? PropertyListSerialization.propertyList(from: archived, options: [], format: nil) as? [String: Any],
+          var objects = plist["$objects"] as? [Any],
+          let index = objects.firstIndex(where: { ($0 as? Data) == observation.data }) else { return archived }
+
+    var floats = [Float](repeating: 0, count: observation.elementCount)
+    _ = floats.withUnsafeMutableBytes { observation.data.copyBytes(to: $0) }
+    let rounded = floats.map { Float(Float16($0)) }
+    guard rounded != floats else { return archived }
+
+    objects[index] = rounded.withUnsafeBytes { Data($0) }
+    plist["$objects"] = objects
+    guard let result = try? PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0),
+          let check = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: result),
+          check.data == objects[index] as? Data else { return archived }
+    return result
+}
+
 func featurePrint(for url: URL) async -> Data? {
     guard let imageData = try? await fetch(url) else { return nil }
     return await withCheckedContinuation { continuation in
-        visionQueue.addOperation { continuation.resume(returning: computeFeaturePrint(imageData)) }
+        visionQueue.addOperation { continuation.resume(returning: computeFeaturePrint(imageData).map(quantizeToHalfPrecision)) }
     }
 }
 
@@ -315,6 +342,12 @@ struct Indexer {
             let currentIds = Set(allFaces.map(\.record.id))
             var vectors = previous?.vectors ?? [:]
             let removedIds = Set(vectors.keys).subtracting(currentIds)
+            var requantized = 0
+            for (id, data) in vectors {
+                let rounded = quantizeToHalfPrecision(data)
+                if rounded != data { vectors[id] = rounded; requantized += 1 }
+            }
+            if requantized > 0 { print("🔧 Rounded \(requantized) carried-over vectors to half precision") }
             let pending = allFaces.filter { face in
                 let upToDate = vectors[face.record.id] != nil && previous?.imageUris[face.record.id] == face.record.imageUri
                 return !upToDate
@@ -366,8 +399,8 @@ struct Indexer {
             var patches = previous?.patches ?? [:]
             var masterVersion = previous?.manifest.masterVersion ?? String(Int(now.timeIntervalSince1970))
             var latestPatch = previous?.manifest.latestPatch ?? 0
-            if previous != nil && !changed.isEmpty {
-                if latestPatch >= Config.maxPatches {
+            if previous != nil && (!changed.isEmpty || requantized > 0) {
+                if latestPatch >= Config.maxPatches || requantized > 0 {
                     // Patches can only add/replace entries, so faces that left the
                     // catalog linger on devices until a rebase drops them. Rebasing
                     // for every removal would make every client re-download the master.
