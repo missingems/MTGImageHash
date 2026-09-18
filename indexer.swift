@@ -3,9 +3,15 @@ import AppKit
 import Accelerate
 
 // MARK: - Models
+// Scryfall replaced `download_uri` (plain JSON array) with `jsonl_download_uri`
+// (gzipped JSON Lines) in mid-2026. Accept either so we survive future flips.
 struct BulkDataResponse: Codable {
-    let downloadUri: String
-    enum CodingKeys: String, CodingKey { case downloadUri = "download_uri" }
+    let downloadUri: String?
+    let jsonlDownloadUri: String?
+    enum CodingKeys: String, CodingKey {
+        case downloadUri = "download_uri"
+        case jsonlDownloadUri = "jsonl_download_uri"
+    }
 }
 
 struct ScryfallCard: Codable {
@@ -39,6 +45,65 @@ struct DatabaseManifest: Codable {
     let lastUpdated: String
 }
 
+// MARK: - Config
+enum Config {
+    static let env = ProcessInfo.processInfo.environment
+    /// Where output files are written (default: current directory).
+    static let outputDir = URL(fileURLWithPath: env["OUTPUT_DIR"] ?? ".", isDirectory: true)
+    /// Optional cap on faces hashed, for quick local test runs.
+    static let limit = env["MTG_LIMIT"].flatMap(Int.init)
+    /// Abort instead of publishing if fewer than this fraction of faces hash successfully.
+    static let minSuccessRatio = 0.98
+}
+
+// Scryfall's API guidelines require a descriptive User-Agent and an Accept header.
+let session: URLSession = {
+    let config = URLSessionConfiguration.default
+    config.httpAdditionalHeaders = [
+        "User-Agent": "MTGImageHash/1.0 (+https://github.com/missingems/MTGImageHash)",
+        "Accept": "application/json;q=0.9,*/*;q=0.8",
+    ]
+    config.timeoutIntervalForRequest = 60
+    return URLSession(configuration: config)
+}()
+
+/// Downloads the bulk card file and decodes it, handling both the legacy JSON array
+/// and the gzipped JSON Lines format.
+func fetchCards() async throws -> [ScryfallCard] {
+    let (metaData, _) = try await session.data(from: URL(string: "https://api.scryfall.com/bulk-data/default-cards")!)
+    let bulkMeta = try JSONDecoder().decode(BulkDataResponse.self, from: metaData)
+    let decoder = JSONDecoder()
+
+    if let jsonl = bulkMeta.jsonlDownloadUri, let url = URL(string: jsonl) {
+        print("📥 Downloading JSONL catalog: \(url.lastPathComponent)")
+        let (tmp, _) = try await session.download(from: url)
+        let gz = tmp.deletingLastPathComponent().appendingPathComponent("default-cards-\(UUID().uuidString).jsonl.gz")
+        try FileManager.default.moveItem(at: tmp, to: gz)
+        defer { try? FileManager.default.removeItem(at: gz) }
+
+        let gunzip = Process()
+        gunzip.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
+        gunzip.arguments = ["-f", gz.path]
+        try gunzip.run()
+        gunzip.waitUntilExit()
+        guard gunzip.terminationStatus == 0 else { throw NSError(domain: "Indexer", code: 2, userInfo: [NSLocalizedDescriptionKey: "gunzip failed"]) }
+        let jsonlFile = gz.deletingPathExtension()
+        defer { try? FileManager.default.removeItem(at: jsonlFile) }
+
+        let data = try Data(contentsOf: jsonlFile)
+        var cards: [ScryfallCard] = []
+        for line in data.split(separator: UInt8(ascii: "\n")) where !line.isEmpty {
+            cards.append(try decoder.decode(ScryfallCard.self, from: Data(line)))
+        }
+        return cards
+    } else if let json = bulkMeta.downloadUri, let url = URL(string: json) {
+        print("📥 Downloading JSON catalog: \(url.lastPathComponent)")
+        let (data, _) = try await session.data(from: url)
+        return try decoder.decode([ScryfallCard].self, from: data)
+    }
+    throw NSError(domain: "Indexer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Bulk data response had no download URI: \(String(decoding: metaData, as: UTF8.self))"])
+}
+
 // MARK: - pHash Engine Setup
 // Wrapped in an enum to prevent "top-level code" compiler errors in a script
 enum MathEngine {
@@ -47,7 +112,7 @@ enum MathEngine {
 
 func generatePHash(from url: URL) async -> UInt64? {
     do {
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await session.data(from: url)
         guard let image = NSImage(data: data),
               let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
         
@@ -127,12 +192,7 @@ struct Indexer {
         
         do {
             print("📥 Fetching Scryfall Bulk Data Catalog...")
-            let (metaData, _) = try await URLSession.shared.data(from: URL(string: "https://api.scryfall.com/bulk-data/default-cards")!)
-            let bulkMeta = try JSONDecoder().decode(BulkDataResponse.self, from: metaData)
-            
-            print("📥 Downloading JSON Catalog...")
-            let (data, _) = try await URLSession.shared.data(from: URL(string: bulkMeta.downloadUri)!)
-            let cards = try JSONDecoder().decode([ScryfallCard].self, from: data)
+            let cards = try await fetchCards()
             
             var jobs: [Job] = []
             for card in cards {
@@ -147,6 +207,8 @@ struct Indexer {
                 }
             }
             
+            if let limit = Config.limit { jobs = Array(jobs.prefix(limit)) }
+
             print("⚙️ Parsed \(cards.count) cards. Hashing \(jobs.count) faces...")
             
             var iosRecords: [CardHashRecord] = []
@@ -181,6 +243,17 @@ struct Indexer {
                 }
             }
             
+            let ratio = Double(iosRecords.count) / Double(max(jobs.count, 1))
+            print("📊 Hashed \(iosRecords.count) / \(jobs.count) faces (\(String(format: "%.2f", ratio * 100))%)")
+            guard ratio >= Config.minSuccessRatio else {
+                print("❌ Success ratio below \(Config.minSuccessRatio * 100)%; refusing to publish a partial database.")
+                exit(1)
+            }
+
+            // Task group completion order is random; sort so output is deterministic.
+            iosRecords.sort { $0.id < $1.id }
+            webRecords.sort { $0.id < $1.id }
+
             print("💾 Encoding iOS BPLIST Database...")
             let encoder = PropertyListEncoder()
             encoder.outputFormat = .binary
@@ -196,9 +269,10 @@ struct Indexer {
             jsonEncoder.outputFormatting = .prettyPrinted
             let manifestData = try jsonEncoder.encode(manifest)
             
-            try compressedIosData.write(to: URL(fileURLWithPath: "MTG_Hashes.bplist"))
-            try webData.write(to: URL(fileURLWithPath: "visualizer_data.json"))
-            try manifestData.write(to: URL(fileURLWithPath: "manifest.json"))
+            try FileManager.default.createDirectory(at: Config.outputDir, withIntermediateDirectories: true)
+            try compressedIosData.write(to: Config.outputDir.appendingPathComponent("MTG_Hashes.bplist"))
+            try webData.write(to: Config.outputDir.appendingPathComponent("visualizer_data.json"))
+            try manifestData.write(to: Config.outputDir.appendingPathComponent("manifest.json"))
             
             let elapsed = Date().timeIntervalSince(startTime)
             print("✅ Finished successfully in \(Int(elapsed / 60)) minutes!")
