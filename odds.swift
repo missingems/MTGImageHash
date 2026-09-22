@@ -58,6 +58,8 @@ struct OddsSheet: Decodable {
     let foil: Bool
     let totalWeight: Double?
     let allowDuplicates: Bool?
+    /// A pack takes every card of a fixed sheet, as a Jumpstart pack takes its whole theme.
+    let fixed: Bool?
 }
 
 struct OddsMeta: Decodable {
@@ -108,7 +110,7 @@ func chances(of config: OddsBoosterConfig) -> [String: (any: Double, foil: Doubl
             guard sheetWeight > 0 else { continue }
             for (uuid, weight) in sheet.cards where weight > 0 {
                 let share = weight / sheetWeight
-                let hit = sheet.allowDuplicates == true ? 1 - pow(1 - share, Double(count)) : min(1, Double(count) * share)
+                let hit = sheet.fixed == true ? 1 : sheet.allowDuplicates == true ? 1 - pow(1 - share, Double(count)) : min(1, Double(count) * share)
                 if sheet.foil { foilMiss[uuid, default: 1] *= 1 - hit } else { nonFoilMiss[uuid, default: 1] *= 1 - hit }
             }
         }
