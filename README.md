@@ -20,6 +20,18 @@ Served from https://missingems.github.io/MTGImageHash/:
 
 Face IDs are the Scryfall card ID, or `<cardId>-face<i>` for multi-faced cards without top-level images.
 
+### Pack data
+
+`odds.swift` runs after the indexer and publishes, from MTGJSON's AllSetFiles:
+
+| File | Contents |
+| --- | --- |
+| `pull-odds-meta.json` | `{format, mtgjsonVersion, bytes, printings, products}`: what Mooligan checks each day. |
+| `pull-odds.json` | Every printing's chance in each product that holds it, keyed by Scryfall id: `{format, mtgjsonVersion, products: [{id, name, setName}], odds: {scryfallId: [[productIndex, chance, foilChance, nonFoilChance]]}}`. Covers other sets' packs: commander decks in the parent's Collector Booster, bonus sheets, and printings filed under one set but sold in another's. |
+| `boosters/<SET>.json` | The set's MTGJSON `booster` object, unchanged, with a stub (`uuid`, `rarity`, `identifiers.scryfallId`) for every card its sheets draw from, whichever set it is filed under. |
+
+The chance maths is Mooligan's `MTGJSONBoosterConfig.chances()`, and the two are kept in step.
+
 ### Client protocol
 
 Mooligan uses the flat index when `index.json` is published: it downloads the parts straight into its index file, and applies `patch_<n>.bin` files when its copy is on the same master with the same projection and at most 20 patches behind. Older versions keep using the archived files below, which are still published unchanged.

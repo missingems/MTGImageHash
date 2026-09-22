@@ -39,6 +39,13 @@ jobs:
           swift indexer.swift
           cp index.html site/
 
+      # Every printing's pull odds and each set's booster sheets, worked out from MTGJSON's
+      # AllSetFiles (MTGJSON builds daily at 9:00 AM EST; the 22:17 run picks each build up).
+      - name: Build pack data
+        env:
+          OUTPUT_DIR: site
+        run: swift odds.swift
+
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site
