@@ -13,10 +13,18 @@ Served from https://missingems.github.io/MTGImageHash/:
 | `MTG_Hashes_Master_<0…7>.lzfse` | The full current database, split into chunks. Each chunk is an LZFSE-compressed binary plist of `[faceId: NSKeyedArchiver(VNFeaturePrintObservation)]`. |
 | `patch_<n>.lzfse` | Entries added or changed since patch `n-1`, in the same format. |
 | `visualizer_data.json` | Card metadata for the web visualizer. It also serves as the index for incremental builds. |
+| `index.json` | The flat index: `{format, masterVersion, latestPatch, cardCount, dimension, shortlistDimension, parts, bytes, projection}`, where `projection` is the SHA-256 of `projection.bin`. |
+| `index_<0…7>.bin` | Byte ranges of one file in Mooligan's `CardFeaturePrintIndex` layout (format 1): header, Float16 vectors, shortlist projection, Float16 shortlist rows, master version, ids. Concatenated in order, it is the index Mooligan maps, with nothing to unarchive. |
+| `projection.bin` | The master's shortlist projection, 128 × 768 Float32. Kept until a rebase, so every patch is projected the same way as devices' copies. |
+| `patch_<n>.bin` | Patch `n` as rows: a header (`"MTGP"`, version 1, count, dimension, shortlist dimension, ids length, patch number), Float16 vectors, projected Float16 shortlist rows, ids. |
 
 Face IDs are the Scryfall card ID, or `<cardId>-face<i>` for multi-faced cards without top-level images.
 
 ### Client protocol
+
+Mooligan uses the flat index when `index.json` is published: it downloads the parts straight into its index file, and applies `patch_<n>.bin` files when its copy is on the same master with the same projection and at most 20 patches behind. Older versions keep using the archived files below, which are still published unchanged.
+
+For the archived files:
 - If `masterVersion` differs from the client's copy, or the client is more than 20 patches behind, it downloads every master chunk. The master always contains every patch.
 - Otherwise the client applies `patch_(local+1)` through `patch_latest` in order.
 

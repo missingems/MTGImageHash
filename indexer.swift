@@ -13,6 +13,16 @@
 //   patch_<n>.lzfse               entries added/changed since patch n-1
 //   visualizer_data.json          card metadata; doubles as the incremental-build index
 //
+// The flat index, which Mooligan downloads straight to disk and maps instead of
+// unarchiving a hundred thousand feature prints on the phone (1 GB and every core
+// for seconds, measured):
+//   index.json                    FlatIndexManifest: parts, patch level, projection digest
+//   index_<i>.bin                 byte ranges of one file in Mooligan's CardFeaturePrintIndex
+//                                 layout, Float16 vectors and search shortlist included
+//   projection.bin                the master's shortlist projection (Float32), kept until a
+//                                 rebase so patches are projected the way devices' copies are
+//   patch_<n>.bin                 FlatPatch: patch n's ids, Float16 vectors and projected rows
+//
 // Master chunks always hold the full current state (including every patch), so a
 // client that downloads the master is immediately current. `masterVersion` only
 // changes on a rebase, which is when clients re-download everything.
@@ -20,6 +30,8 @@
 import Foundation
 import AppKit
 import Vision
+import Accelerate
+import CryptoKit
 
 // MARK: - Config
 
@@ -287,6 +299,8 @@ struct PreviousState {
     var vectors: [String: Data]
     var imageUris: [String: String]
     var patches: [Int: Data]
+    /// The shortlist projection the flat index was published with, nil before the flat index existed.
+    var projection: [Float]?
 }
 
 /// Loads the previously published site. Returns nil when there is nothing usable
@@ -321,7 +335,11 @@ func loadPreviousState() async throws -> PreviousState? {
     let records = try JSONDecoder().decode([WebCardRecord].self, from: indexData)
     let imageUris = Dictionary(records.map { ($0.id, $0.imageUri) }, uniquingKeysWith: { _, new in new })
 
-    return PreviousState(manifest: manifest, vectors: vectors, imageUris: imageUris, patches: patches)
+    let projection = try await fetch(base.appendingPathComponent("projection.bin")).map { data in
+        data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    }
+
+    return PreviousState(manifest: manifest, vectors: vectors, imageUris: imageUris, patches: patches, projection: projection)
 }
 
 // MARK: - Main
@@ -435,6 +453,18 @@ struct Indexer {
             }
             try JSONEncoder().encode(records).write(to: Config.outputDir.appendingPathComponent("visualizer_data.json"))
 
+            // The flat index. Its projection is the master's, carried over while the master holds, so
+            // rows published in later patches are projected as devices' copies were.
+            let keepsProjection = previous?.manifest.masterVersion == masterVersion
+            try writeFlatIndex(
+                vectors: vectors,
+                patches: patches,
+                masterVersion: masterVersion,
+                latestPatch: latestPatch,
+                previousProjection: keepsProjection ? previous?.projection : nil,
+                to: Config.outputDir
+            )
+
             let manifest = Manifest(masterVersion: masterVersion, masterChunks: Config.masterChunks, latestPatch: latestPatch,
                                     cardCount: vectors.count, lastUpdated: ISO8601DateFormatter().string(from: now))
             let encoder = JSONEncoder()
@@ -446,6 +476,182 @@ struct Indexer {
             fail("Fatal Error: \(error)")
         }
     }
+}
+
+// MARK: - Flat index
+
+/// Mooligan's CardFeaturePrintIndex file header magic ("MTGV") and FlatPatch magic ("MTGP").
+let flatIndexMagic: UInt32 = 0x5647_544D
+let flatPatchMagic: UInt32 = 0x5047_544D
+let flatIndexParts = 8
+let shortlistDimension = 128
+
+struct FlatIndexManifest: Codable {
+    /// 1: CardFeaturePrintIndex format version 1, split into `parts`.
+    let format: Int
+    let masterVersion: String
+    let latestPatch: Int
+    let cardCount: Int
+    let dimension: Int
+    let shortlistDimension: Int
+    let parts: [String]
+    let bytes: Int
+    /// SHA-256 of the projection's bytes: a device whose copy was projected differently takes the
+    /// whole index rather than patches it cannot line up.
+    let projection: String
+}
+
+/// Feature prints as Float16 rows, in the order of `ids`, skipping any that do not unarchive or are
+/// not finite, as Mooligan does.
+func halfRows(_ vectors: [String: Data], ids: [String]) -> (ids: [String], dimension: Int, rows: [Float16]) {
+    var kept: [String] = []
+    var rows: [Float16] = []
+    var dimension = 0
+    for id in ids {
+        autoreleasepool {
+            guard let archive = vectors[id],
+                  let observation = try? NSKeyedUnarchiver.unarchivedObject(ofClass: VNFeaturePrintObservation.self, from: archive),
+                  observation.elementType == .float else { return }
+            if dimension == 0 {
+                dimension = observation.elementCount
+                rows.reserveCapacity(ids.count * dimension)
+            }
+            guard observation.elementCount == dimension else { return }
+            var floats = [Float](repeating: 0, count: dimension)
+            _ = floats.withUnsafeMutableBytes { observation.data.copyBytes(to: $0) }
+            guard floats.allSatisfy(\.isFinite) else { return }
+            kept.append(id)
+            rows.append(contentsOf: floats.map { Float16($0) })
+        }
+    }
+    return (kept, dimension, rows)
+}
+
+/// The 128 directions the vectors vary along most, from ~8,000 of them, one row of `dimension` each,
+/// as Mooligan's `compressedForSearch()` works them out.
+func shortlistProjection(_ rows: [Float16], count: Int, dimension: Int) -> [Float] {
+    let sampleRows = Array(stride(from: 0, to: count, by: max(1, count / 8_192)))
+    var sample = [Float](repeating: 0, count: sampleRows.count * dimension)
+    for (position, row) in sampleRows.enumerated() {
+        for column in 0..<dimension { sample[position * dimension + column] = Float(rows[row * dimension + column]) }
+    }
+    var mean = [Float](repeating: 0, count: dimension)
+    for column in 0..<dimension {
+        var total: Float = 0
+        for position in 0..<sampleRows.count { total += sample[position * dimension + column] }
+        mean[column] = total / Float(sampleRows.count)
+    }
+    var covariance = [Float](repeating: 0, count: dimension * dimension)
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, Int32(dimension), Int32(dimension), Int32(sampleRows.count),
+                1 / Float(sampleRows.count), sample, Int32(dimension), sample, Int32(dimension), 0, &covariance, Int32(dimension))
+    cblas_sger(CblasRowMajor, Int32(dimension), Int32(dimension), -1, mean, 1, mean, 1, &covariance, Int32(dimension))
+
+    var eigenvalues = [Float](repeating: 0, count: dimension)
+    var order = __CLPK_integer(dimension), leading = __CLPK_integer(dimension)
+    var workSize = __CLPK_integer(-1), optimal: Float = 0, info = __CLPK_integer(0)
+    var jobz = Int8(UInt8(ascii: "V")), uplo = Int8(UInt8(ascii: "U"))
+    ssyev_(&jobz, &uplo, &order, &covariance, &leading, &eigenvalues, &optimal, &workSize, &info)
+    workSize = __CLPK_integer(optimal)
+    var work = [Float](repeating: 0, count: Int(workSize))
+    ssyev_(&jobz, &uplo, &order, &covariance, &leading, &eigenvalues, &work, &workSize, &info)
+    guard info == 0 else { fail("Could not work out the shortlist projection (ssyev \(info))") }
+    // Eigenvectors come by ascending eigenvalue, one per run of `dimension`: the last 128 are wanted.
+    return Array(covariance[(dimension - shortlistDimension) * dimension..<dimension * dimension])
+}
+
+/// Every row projected onto `projection`, as Float16.
+func projected(_ rows: [Float16], count: Int, dimension: Int, projection: [Float]) -> [Float16] {
+    var output = [Float16]()
+    output.reserveCapacity(count * shortlistDimension)
+    var block = [Float](repeating: 0, count: 4_096 * dimension)
+    var projectedBlock = [Float](repeating: 0, count: 4_096 * shortlistDimension)
+    for start in stride(from: 0, to: count, by: 4_096) {
+        let end = min(start + 4_096, count)
+        for index in 0..<(end - start) * dimension { block[index] = Float(rows[start * dimension + index]) }
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, Int32(end - start), Int32(shortlistDimension), Int32(dimension),
+                    1, block, Int32(dimension), projection, Int32(dimension), 0, &projectedBlock, Int32(shortlistDimension))
+        output.append(contentsOf: projectedBlock[0..<(end - start) * shortlistDimension].map { Float16($0) })
+    }
+    return output
+}
+
+func littleEndianHeader(_ fields: [UInt32]) -> Data {
+    fields.map(\.littleEndian).withUnsafeBytes { Data($0) }
+}
+
+func bytes<T>(_ array: [T]) -> Data {
+    array.withUnsafeBytes { Data($0) }
+}
+
+func writeFlatIndex(
+    vectors: [String: Data],
+    patches: [Int: Data],
+    masterVersion: String,
+    latestPatch: Int,
+    previousProjection: [Float]?,
+    to directory: URL
+) throws {
+    let (ids, dimension, rows) = halfRows(vectors, ids: vectors.keys.sorted())
+    guard dimension > 0 else { fail("No feature prints to write the flat index from") }
+    let projection = previousProjection.flatMap { $0.count == shortlistDimension * dimension ? $0 : nil }
+        ?? shortlistProjection(rows, count: ids.count, dimension: dimension)
+    let shortlist = projected(rows, count: ids.count, dimension: dimension, projection: projection)
+
+    // CardFeaturePrintIndex format 1: header, vectors, projection, shortlist, master version, ids.
+    let version = Data(masterVersion.utf8)
+    let idData = Data(ids.joined(separator: "\n").utf8)
+    var file = littleEndianHeader([
+        flatIndexMagic, 1, UInt32(ids.count), UInt32(dimension), UInt32(bitPattern: Int32(latestPatch)),
+        UInt32(version.count), UInt32(idData.count), UInt32(shortlistDimension),
+    ])
+    file.append(bytes(rows))
+    file.append(bytes(projection))
+    file.append(bytes(shortlist))
+    file.append(version)
+    file.append(idData)
+
+    let partSize = (file.count + flatIndexParts - 1) / flatIndexParts
+    var parts: [String] = []
+    for part in 0..<flatIndexParts {
+        let range = min(part * partSize, file.count)..<min((part + 1) * partSize, file.count)
+        let name = "index_\(part).bin"
+        try file.subdata(in: range).write(to: directory.appendingPathComponent(name))
+        parts.append(name)
+    }
+    let projectionData = bytes(projection)
+    try projectionData.write(to: directory.appendingPathComponent("projection.bin"))
+
+    for (number, patch) in patches {
+        let entries = try decodeDatabase(patch)
+        let (patchIDs, patchDimension, patchRows) = halfRows(entries, ids: entries.keys.sorted())
+        guard patchDimension == dimension || patchIDs.isEmpty else { fail("Patch \(number) has \(patchDimension)-float prints") }
+        let patchShortlist = projected(patchRows, count: patchIDs.count, dimension: dimension, projection: projection)
+        let patchIDData = Data(patchIDs.joined(separator: "\n").utf8)
+        var patchFile = littleEndianHeader([
+            flatPatchMagic, 1, UInt32(patchIDs.count), UInt32(dimension), UInt32(shortlistDimension),
+            UInt32(patchIDData.count), UInt32(number), 0,
+        ])
+        patchFile.append(bytes(patchRows))
+        patchFile.append(bytes(patchShortlist))
+        patchFile.append(patchIDData)
+        try patchFile.write(to: directory.appendingPathComponent("patch_\(number).bin"))
+    }
+
+    let manifest = FlatIndexManifest(
+        format: 1,
+        masterVersion: masterVersion,
+        latestPatch: latestPatch,
+        cardCount: ids.count,
+        dimension: dimension,
+        shortlistDimension: shortlistDimension,
+        parts: parts,
+        bytes: file.count,
+        projection: SHA256.hash(data: projectionData).map { String(format: "%02x", $0) }.joined()
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(manifest).write(to: directory.appendingPathComponent("index.json"))
+    print("🗂️ Flat index: \(ids.count) faces, \(file.count / 1_048_576) MB in \(flatIndexParts) parts, \(patches.count) flat patches")
 }
 
 await Indexer.main()
