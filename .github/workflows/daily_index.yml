@@ -46,6 +46,17 @@ jobs:
           OUTPUT_DIR: site
         run: swift odds.swift
 
+      # Every card's TCGplayer history and Card Kingdom's latest prices from MTGJSON's AllPrices, as
+      # one file and a file of each day's changes. Compiled optimised: the step streams 1.2 GB of JSON.
+      # A failure here must not hold back the card image database; the app keeps the prices it has.
+      - name: Build price history
+        continue-on-error: true
+        env:
+          OUTPUT_DIR: site
+        run: |
+          swiftc -O prices.swift -o prices-builder
+          ./prices-builder
+
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site

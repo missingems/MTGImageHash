@@ -32,6 +32,20 @@ Face IDs are the Scryfall card ID, or `<cardId>-face<i>` for multi-faced cards w
 
 The chance maths is Mooligan's `MTGJSONBoosterConfig.chances()`, and the two are kept in step.
 
+It also writes `work/scryfall-ids.tsv`, MTGJSON uuid to Scryfall id, for the price step. That file is not published.
+
+### Prices
+
+`prices.swift` runs after the pack data, compiled with `-O` because it streams MTGJSON's AllPrices (about 1.2 GB unpacked). It keeps only what Mooligan's card page shows: TCGplayer's retail price per finish, day by day, and Card Kingdom's latest retail and buylist price per finish.
+
+| File | Contents |
+| --- | --- |
+| `prices-meta.json` | `{format, mtgjsonVersion, firstDay, lastDay, cards, full: {path, bytes}, days: [{day, previousDay, path, bytes}]}`: what Mooligan checks, four times a day at most. |
+| `prices/history.bin.gz` | Every card's prices over the days MTGJSON keeps (about 90), about 7 MB. |
+| `prices/<YYYY-MM-DD>.bin.gz` | The cards whose prices changed that day, for each of the last 14 days MTGJSON has, about 700 KB each. A price that is not listed held from `previousDay`. |
+
+The binary layouts are described at the top of `prices.swift`. A phone whose prices run up to one of the listed `previousDay`s downloads only the days after it. Otherwise it downloads the whole history again.
+
 ### Client protocol
 
 Mooligan uses the flat index when `index.json` is published: it downloads the parts straight into its index file, and applies `patch_<n>.bin` files when its copy is on the same master with the same projection and at most 20 patches behind. Older versions keep using the archived files below, which are still published unchanged.
@@ -52,6 +66,12 @@ Local test run:
 
 ```bash
 OUTPUT_DIR=site FULL_REBUILD=1 MTG_LIMIT=300 swift indexer.swift
+```
+
+The price step reads a local AllPrices file when `ALLPRICES_FILE` is set:
+
+```bash
+swift odds.swift && swiftc -O prices.swift -o prices-builder && ALLPRICES_FILE=AllPrices.json.xz ./prices-builder
 ```
 
 `FULL_REBUILD=1` skips fetching the previous state. Without it, the run aborts if the state server is unreachable, so a network blip never triggers a full rebuild.

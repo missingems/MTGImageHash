@@ -20,6 +20,7 @@ enum OddsConfig {
     static let env = ProcessInfo.processInfo.environment
     static let outputDir = URL(fileURLWithPath: env["OUTPUT_DIR"] ?? "site", isDirectory: true)
     /// A folder of MTGJSON set files to use instead of downloading AllSetFiles.zip, for local runs.
+    static let idsFile = URL(fileURLWithPath: env["IDS_FILE"] ?? "work/scryfall-ids.tsv")
     static let setFilesDir = env["MTGJSON_SET_FILES"].map { URL(fileURLWithPath: $0, isDirectory: true) }
 }
 
@@ -230,6 +231,12 @@ func main() async throws {
 
     let out = OddsConfig.outputDir
     try fm.createDirectory(at: out, withIntermediateDirectories: true)
+
+    // MTGJSON uuid to Scryfall id for prices.swift, which reads AllPrices, keyed by uuid alone. Not
+    // published: it is only a step's input.
+    try fm.createDirectory(at: OddsConfig.idsFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try scryfallByUUID.map { "\($0.key)\t\($0.value)" }.joined(separator: "\n")
+        .write(to: OddsConfig.idsFile, atomically: true, encoding: .utf8)
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let oddsData = try encoder.encode(PullOddsFile(format: 1, mtgjsonVersion: version, products: products, odds: odds))
